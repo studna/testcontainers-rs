@@ -79,7 +79,8 @@ where
     }
 
     pub(crate) async fn copy_to_container(&self) -> Result<()> {
-        for source in self.image.copy_to_sources() {
+        let sources: Vec<_> = self.image.copy_to_sources().collect();
+        for source in sources {
             self.docker_client()
                 .copy_to_container(self.id(), source)
                 .await?;

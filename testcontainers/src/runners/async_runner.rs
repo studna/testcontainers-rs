@@ -1521,6 +1521,21 @@ mod retained_api_tests {
     }
 
     #[test]
+    fn retained_run_is_send_without_polling_or_starting_a_runtime() {
+        fn require_send<F: std::future::Future + Send>(_: F) {}
+        let generic = StartupOwner::new(GenericImage::new("alpine", "3.21").into());
+        require_send(generic.run());
+        let callback = StartupOwner::new(
+            CallbackImage {
+                mode: 2,
+                readiness_calls: Arc::new(AtomicUsize::new(0)),
+            }
+            .into(),
+        );
+        require_send(callback.run());
+    }
+
+    #[test]
     fn collision_is_post_provenance_not_callback_error_shape() {
         assert!(create_collision(&Err(post_error(409))));
         assert!(!create_collision(&Err(post_error(404))));
