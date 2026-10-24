@@ -108,22 +108,29 @@ mod tests {
             runtime.block_on(async {
                 let handle = Handle::current();
                 let before = snapshot();
+                assert!(!before.1);
+                let before_seq = before.0.last().map_or(0, |event| event.seq);
                 crate::core::async_drop::async_drop(async {});
                 let after = snapshot();
                 assert!(!after.1);
                 assert!(after.2 > before.2);
-                let event = after
+                let invocation: Vec<_> = after
                     .0
                     .iter()
-                    .rev()
-                    .find(|event| {
-                        event.kind == Kind::AsyncDropEntry && event.runtime == Some(handle.id())
+                    .filter(|event| {
+                        event.seq > before_seq
+                            && event.runtime == Some(handle.id())
+                            && event.thread == thread::current().id()
                     })
-                    .unwrap();
+                    .collect();
+                assert_eq!(invocation.len(), 1);
+                let event = invocation[0];
+                assert_eq!(event.kind, Kind::AsyncDropEntry);
                 assert_eq!(event.thread, thread::current().id());
                 assert_eq!(event.flavor, Some(handle.runtime_flavor()));
                 assert!(event.id.is_empty());
                 assert!(event.token.is_none());
+                assert!(event.disarmed.is_none());
                 assert!(event.seq > before.0.last().map_or(0, |event| event.seq));
                 let mut bounded = Log::default();
                 for _ in 0..=CAPACITY {
@@ -134,7 +141,7 @@ mod tests {
                 assert_eq!(bounded.total_async_drop, CAPACITY as u64 + 1);
                 assert_eq!(bounded.events.first().unwrap().seq, 1);
                 assert_eq!(bounded.events.last().unwrap().seq, CAPACITY as u64);
-                assert_eq!(snapshot().0.len(), after.0.len());
+                assert!(after.0.windows(2).all(|pair| pair[0].seq < pair[1].seq));
             });
         }
     }
