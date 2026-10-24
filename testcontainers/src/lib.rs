@@ -94,7 +94,7 @@ pub use crate::core::{
     error::TestcontainersError,
     BuildableImage, ContainerAsync, ContainerRequest, Healthcheck, Image, ImageExt,
 };
-pub use crate::runners::StartupOwner;
+pub use crate::runners::{StartupOwner, StartupSnapshot};
 
 #[cfg(feature = "watchdog")]
 #[cfg_attr(docsrs, doc(cfg(feature = "watchdog")))]

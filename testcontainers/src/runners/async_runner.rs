@@ -147,15 +147,42 @@ const OWNER_LABEL: &str = "org.testcontainers.startup-owner";
 /// Shared custody of one startup. Register this synchronously before spawning `run`.
 /// Retain and join that original task on its original runtime; never abort `run`.
 /// Join startup and close all dependent pools before calling `take_ready` or cleanup.
-pub struct StartupOwner<I: Image>(std::sync::Arc<tokio::sync::Mutex<StartupState<I>>>);
+pub struct StartupOwner<I: Image>(
+    std::sync::Arc<tokio::sync::Mutex<StartupState<I>>>,
+    std::sync::Arc<std::sync::Mutex<StartupSnapshot>>,
+);
+
+/// Immutable diagnostic copy; obtaining it never acquires the startup mutex.
+/// A pending phase is not proof of success, join collection or physical absence.
+#[derive(Clone, Debug, Default)]
+pub struct StartupSnapshot {
+    pub phase: &'static str,
+    pub name: String,
+    pub owner_token: String,
+    pub id: Option<String>,
+    pub owner_present: bool,
+    pub submitted: bool,
+    pub collision: bool,
+    pub deadline: Option<tokio::time::Instant>,
+    pub failure: Option<String>,
+}
 
 impl<I: Image> Clone for StartupOwner<I> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1.clone())
+    }
+}
+
+impl<I: Image> std::fmt::Debug for StartupOwner<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StartupOwner")
+            .field(&self.snapshot())
+            .finish()
     }
 }
 
 struct StartupState<I: Image> {
+    observed: std::sync::Arc<std::sync::Mutex<StartupSnapshot>>,
     request: Option<ContainerRequest<I>>,
     client: Option<std::sync::Arc<Client>>,
     network: Option<std::sync::Arc<Network>>,
@@ -189,7 +216,20 @@ impl<I: Image> StartupOwner<I> {
         let mut state = StartupState::new(request);
         state.name = name;
         state.token = token;
-        Self(std::sync::Arc::new(tokio::sync::Mutex::new(state)))
+        state.publish();
+        let observed = state.observed.clone();
+        Self(
+            std::sync::Arc::new(tokio::sync::Mutex::new(state)),
+            observed,
+        )
+    }
+
+    /// Observe progress even while the original startup or cleanup future is suspended.
+    pub fn snapshot(&self) -> StartupSnapshot {
+        self.1
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Execute once. Observer expiry must stop borrowing the join, never this future.
@@ -203,28 +243,15 @@ impl<I: Image> StartupOwner<I> {
         }
         state.started = true;
         state.phase = "creating";
+        state.publish();
         let result = state.start_retained().await;
         match result {
             Ok(()) => {
                 state.phase = "ready";
+                state.publish();
                 Ok(())
             }
-            Err(error) => {
-                state.collision |= matches!(
-                    &error,
-                    crate::TestcontainersError::Client(ClientError::CreateContainer(
-                        bollard::errors::Error::DockerResponseServerError {
-                            status_code: 409,
-                            ..
-                        }
-                    ))
-                );
-                let error = state
-                    .failure
-                    .get_or_insert_with(|| std::sync::Arc::new(error))
-                    .clone();
-                Err(crate::TestcontainersError::other(error))
-            }
+            Err(error) => Err(state.fail(error)),
         }
     }
 
@@ -240,10 +267,12 @@ impl<I: Image> StartupOwner<I> {
             ));
         }
         state.phase = "transferred";
-        state
+        let owner = state
             .owner
             .take()
-            .ok_or_else(|| crate::TestcontainersError::other("owner already taken"))
+            .ok_or_else(|| crate::TestcontainersError::other("owner already taken"));
+        state.publish();
+        owner
     }
 
     /// Retire only confirmed absence. Submitted unknown/name404 remains pending.
@@ -255,21 +284,21 @@ impl<I: Image> StartupOwner<I> {
         if state.phase != "transferred" && state.phase != "retired" {
             state.phase = "closing"; // Cancellation/panic must revoke ready transfer too.
         }
-        let result = state.close().await;
-        if let Err(error) = result {
-            let error = state
-                .failure
-                .get_or_insert_with(|| std::sync::Arc::new(error))
-                .clone();
-            return Err(crate::TestcontainersError::other(error));
+        state.publish();
+        match state.close().await {
+            Err(error) => Err(state.fail(error)),
+            Ok(retired) => {
+                state.publish();
+                Ok(retired)
+            }
         }
-        result
     }
 }
 
 impl<I: Image> StartupState<I> {
     fn new(request: ContainerRequest<I>) -> Self {
         Self {
+            observed: Default::default(),
             request: Some(request),
             client: None,
             network: None,
@@ -286,6 +315,51 @@ impl<I: Image> StartupState<I> {
             deadline: None,
             failure: None,
         }
+    }
+
+    fn publish(&self) {
+        // Formatting an arbitrary error must not hold the diagnostic mutex.
+        let snapshot = StartupSnapshot {
+            phase: self.phase,
+            name: self.name.clone(),
+            owner_token: self.token.clone(),
+            id: self.id.clone(),
+            owner_present: self.owner.is_some(),
+            submitted: self.submitted,
+            collision: self.collision,
+            deadline: self.deadline,
+            failure: self.failure.as_ref().map(ToString::to_string),
+        };
+        *self
+            .observed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = snapshot;
+    }
+
+    fn fail(&mut self, error: crate::TestcontainersError) -> crate::TestcontainersError {
+        let error = self
+            .failure
+            .get_or_insert_with(|| std::sync::Arc::new(error))
+            .clone();
+        self.publish();
+        crate::TestcontainersError::other(error)
+    }
+
+    fn recovered_id(&self, info: bollard::models::ContainerInspectResponse) -> Result<String> {
+        let labels = info
+            .config
+            .and_then(|config| config.labels)
+            .unwrap_or_default();
+        if labels.get(OWNER_LABEL) != Some(&self.token)
+            || info.name.as_deref() != Some(&format!("/{}", self.name))
+        {
+            return Err(crate::TestcontainersError::other(
+                "reserved name/token mismatch",
+            ));
+        }
+        info.id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| crate::TestcontainersError::other("recovered container has no ID"))
     }
 
     fn install_owner(&mut self) {
@@ -309,9 +383,13 @@ impl<I: Image> StartupState<I> {
         self.create(true).await?;
         self.install_owner(); // No suspension or user callback between ACK and custody.
         self.phase = "copying";
+        self.publish();
+        self.owner
+            .as_ref()
+            .expect("registered actual owner")
+            .copy_to_container()
+            .await?;
         let owner = self.owner.as_mut().expect("registered actual owner");
-        owner.start_log_consumers();
-        owner.copy_to_container().await?;
         #[cfg(feature = "watchdog")]
         if owner.docker_client().config.command() == crate::core::env::Command::Remove {
             crate::watchdog::register(owner.id().to_string());
@@ -320,6 +398,14 @@ impl<I: Image> StartupState<I> {
         let timeout = owner.startup_timeout();
         let deadline = tokio::time::Instant::now() + timeout;
         self.deadline = Some(deadline);
+        {
+            let mut observed = self
+                .observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            observed.phase = self.phase;
+            observed.deadline = self.deadline;
+        }
         let readiness = owner.start_until_ready();
         tokio::pin!(readiness);
         match tokio::time::timeout_at(deadline, &mut readiness).await {
@@ -328,6 +414,10 @@ impl<I: Image> StartupState<I> {
                 self.failure = Some(std::sync::Arc::new(
                     WaitContainerError::StartupTimeout.into(),
                 ));
+                self.observed
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .failure = Some(WaitContainerError::StartupTimeout.to_string());
                 let _ = readiness.await; // Same pinned future, reactor and deadline; no restart.
                 Err(WaitContainerError::StartupTimeout.into())
             }
@@ -338,25 +428,16 @@ impl<I: Image> StartupState<I> {
         if self.phase == "retired" {
             return Ok(true);
         }
-        if self.phase == "transferred" || self.collision {
+        if self.phase == "transferred" {
             return Ok(false);
         }
         if self.owner.is_none() && self.submitted {
             let client = self.client.as_ref().expect("submitted client");
             match client.inspect(&self.name).await {
                 Ok(info) => {
-                    let labels = info
-                        .config
-                        .and_then(|config| config.labels)
-                        .unwrap_or_default();
-                    if labels.get(OWNER_LABEL) != Some(&self.token)
-                        || info.name.as_deref() != Some(&format!("/{}", self.name))
-                        || info.id.as_ref().is_none_or(String::is_empty)
-                    {
-                        return Ok(false);
-                    }
-                    self.id = info.id;
+                    self.id = Some(self.recovered_id(info)?);
                     self.install_owner(); // Store actual recovered owner before the next await.
+                    self.publish();
                 }
                 Err(ClientError::InspectContainer(
                     bollard::errors::Error::DockerResponseServerError {
@@ -663,12 +744,20 @@ impl<I: Image> StartupState<I> {
             config.cmd = Some(cmd);
         }
 
+        let observed = self.observed.clone();
+        let publish_submission = |submitted| {
+            observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .submitted = submitted;
+        };
         // The submitted bit is durable before either POST is first polled.
         self.submitted = true;
+        publish_submission(true);
         let create_result = client
             .create_container(create_options.clone(), config.clone())
             .await;
-        let container_id = match create_result {
+        let final_result = match create_result {
             Ok(id) => Ok(id),
             Err(ClientError::CreateContainer(
                 bollard::errors::Error::DockerResponseServerError {
@@ -676,6 +765,7 @@ impl<I: Image> StartupState<I> {
                 },
             )) => {
                 self.submitted = false; // A joined image-not-found reply is definitive.
+                publish_submission(false);
                 client
                     .pull_image(
                         &container_req.descriptor(),
@@ -683,24 +773,44 @@ impl<I: Image> StartupState<I> {
                     )
                     .await?;
                 self.submitted = true;
+                publish_submission(true);
                 client.create_container(create_options, config).await
             }
-            Err(error) => {
-                self.collision = matches!(
-                    &error,
-                    ClientError::CreateContainer(
-                        bollard::errors::Error::DockerResponseServerError {
-                            status_code: 409,
-                            ..
-                        }
-                    )
-                );
-                Err(error)
-            }
-        }?;
+            other => other,
+        };
+        // This boundary sees only genuine POST replies, never a later Image callback error.
+        self.collision = create_collision(&final_result);
+        if self.collision
+            || matches!(
+                &final_result,
+                Err(ClientError::CreateContainer(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }
+                ))
+            )
+        {
+            self.submitted = false; // Joined409 or image404 certifies no creation by this POST.
+        }
+        publish_submission(self.submitted);
+        let container_id = final_result?;
         self.id = Some(container_id.clone());
+        self.publish();
         Ok(container_id)
     }
+}
+
+fn create_collision(result: &std::result::Result<String, ClientError>) -> bool {
+    matches!(
+        result,
+        Err(ClientError::CreateContainer(
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                ..
+            }
+        ))
+    )
 }
 
 impl From<&Mount> for bollard::models::Mount {
@@ -1388,5 +1498,213 @@ mod tests {
             "Container should be running after restart"
         );
         container2.rm().await.map_err(anyhow::Error::from)
+    }
+}
+
+#[cfg(test)]
+mod retained_api_tests {
+    use super::*;
+    use crate::{
+        core::{ExecCommand, WaitFor},
+        GenericImage, ImageExt,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn post_error(status_code: u16) -> ClientError {
+        ClientError::CreateContainer(bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: "regression".into(),
+        })
+    }
+
+    #[test]
+    fn collision_is_post_provenance_not_callback_error_shape() {
+        assert!(create_collision(&Err(post_error(409))));
+        assert!(!create_collision(&Err(post_error(404))));
+        assert!(!create_collision(&Err(post_error(500))));
+        assert!(!create_collision(&Ok("acknowledged-id".into())));
+        let mut state = StartupState::new(GenericImage::new("alpine", "3.21").into());
+        state.fail(post_error(409).into()); // Same error may legally come from an Image callback.
+        assert!(!state.collision);
+        assert!(state.failure.is_some());
+    }
+
+    async fn diagnostic_exclusion() {
+        let owner = StartupOwner::new(GenericImage::new("alpine", "3.21").into());
+        let alias = owner.clone();
+        let guard = owner.0.lock().await;
+        let before = alias.snapshot(); // Must finish while the startup mutex is held.
+        assert!(!before.name.is_empty());
+        assert!(!before.owner_token.is_empty());
+        assert!(alias.run().await.is_err());
+        assert!(!alias.close_retained().await.unwrap());
+        assert!(alias.take_ready().await.is_err());
+        assert_eq!(alias.snapshot().owner_token, before.owner_token);
+        drop(guard);
+        assert!(owner.close_retained().await.unwrap()); // Component only: no POST admitted.
+        assert!(owner.close_retained().await.unwrap());
+        assert_eq!(owner.snapshot().phase, "retired");
+        let collision = StartupOwner::new(GenericImage::new("alpine", "3.21").into());
+        {
+            let mut state = collision.0.lock().await;
+            state.started = true;
+            state.collision = true;
+            state.fail(post_error(409).into());
+            assert!(!state.submitted); // Component: collected definitive no-create, no client.
+        }
+        assert!(collision.close_retained().await.unwrap());
+        assert!(collision.snapshot().failure.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn diagnostics_during_locked_startup_current_thread() {
+        diagnostic_exclusion().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnostics_during_locked_startup_multi_thread() {
+        diagnostic_exclusion().await;
+    }
+
+    #[test]
+    fn recovery_identity_errors_latch_original_failure() {
+        let owner = StartupOwner::new(GenericImage::new("alpine", "3.21").into());
+        let mut state = owner.0.try_lock().unwrap();
+        let valid = bollard::models::ContainerInspectResponse {
+            id: Some("id".into()),
+            name: Some(format!("/{}", state.name)),
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(HashMap::from([(OWNER_LABEL.into(), state.token.clone())])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for case in 0..5 {
+            let mut invalid = valid.clone();
+            match case {
+                0 => invalid.name = Some("/foreign".into()),
+                1 => invalid.config = None,
+                2 => {
+                    invalid.config.as_mut().unwrap().labels = Some(HashMap::from([(
+                        OWNER_LABEL.into(),
+                        "foreign-token".into(),
+                    )]))
+                }
+                3 => invalid.id = None,
+                _ => invalid.id = Some(String::new()),
+            }
+            let error = state.recovered_id(invalid).unwrap_err();
+            state.fail(error);
+            assert!(owner.snapshot().failure.is_some());
+        }
+        assert_eq!(state.recovered_id(valid).unwrap(), "id");
+        assert!(state.failure.is_some()); // Later valid evidence never erases the error.
+    }
+
+    #[derive(Debug)]
+    struct CallbackImage {
+        mode: u8,
+        readiness_calls: Arc<AtomicUsize>,
+    }
+    impl Image for CallbackImage {
+        fn name(&self) -> &str {
+            "alpine"
+        }
+        fn tag(&self) -> &str {
+            "3.21"
+        }
+        fn entrypoint(&self) -> Option<&str> {
+            (self.mode == 1).then_some("/testcontainers-missing-entrypoint")
+        }
+        fn ready_conditions(&self) -> Vec<WaitFor> {
+            self.readiness_calls.fetch_add(1, Ordering::SeqCst);
+            vec![]
+        }
+        fn exec_before_ready(&self, _: ContainerState) -> Result<Vec<ExecCommand>> {
+            if self.mode == 2 {
+                Err(post_error(409).into())
+            } else {
+                Ok(vec![])
+            }
+        }
+        fn exec_after_start(&self, _: ContainerState) -> Result<Vec<ExecCommand>> {
+            if self.mode == 3 {
+                Err(post_error(409).into())
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    async fn real_callback_regressions() {
+        for mode in 0..4 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut request = CallbackImage {
+                mode,
+                readiness_calls: calls.clone(),
+            }
+            .with_cmd(["sleep", "60"]);
+            if mode == 0 {
+                request = request.with_copy_to(
+                    "/fixture",
+                    std::path::PathBuf::from(format!(
+                        "/testcontainers-missing-{}",
+                        uuid::Uuid::new_v4()
+                    )),
+                );
+            }
+            let owner = StartupOwner::new(request);
+            let task_owner = owner.clone();
+            let joined = tokio::spawn(async move { task_owner.run().await })
+                .await
+                .unwrap();
+            assert!(joined.is_err());
+            let (id, client, address) = {
+                let state = owner.0.lock().await;
+                let actual = state.owner.as_ref().expect("actual ACK owner retained");
+                assert_eq!(actual.log_consumers_started, mode >= 2);
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(mode >= 2));
+                assert!(!state.collision, "callback409 is not a POST collision");
+                (
+                    actual.id().to_string(),
+                    actual.docker_client().clone(),
+                    actual as *const _ as usize,
+                )
+            };
+            let failure = owner.snapshot().failure.expect("joined failure latched");
+            assert_eq!(owner.snapshot().id.as_deref(), Some(id.as_str()));
+            assert!(owner.run().await.is_err()); // Duplicate never replaces the stored owner.
+            {
+                let state = owner.0.lock().await;
+                assert_eq!(state.owner.as_ref().unwrap() as *const _ as usize, address);
+            }
+            assert!(owner.close_retained().await.unwrap());
+            assert!(owner.close_retained().await.unwrap());
+            assert_eq!(owner.snapshot().failure.as_deref(), Some(failure.as_str()));
+            assert!(!owner.snapshot().owner_present);
+            assert!(matches!(
+                client.inspect(&id).await,
+                Err(ClientError::InspectContainer(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }
+                ))
+            ));
+            assert!(owner.take_ready().await.is_err());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires real Engine; main runs explicitly after source handoff"]
+    async fn retained_callback_order_and_cleanup_current_thread() {
+        real_callback_regressions().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires real Engine; main runs explicitly after source handoff"]
+    async fn retained_callback_order_and_cleanup_multi_thread() {
+        real_callback_regressions().await;
     }
 }

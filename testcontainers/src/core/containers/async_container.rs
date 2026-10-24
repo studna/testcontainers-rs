@@ -36,6 +36,8 @@ pub struct ContainerAsync<I: Image> {
     image: ContainerRequest<I>,
     network: Option<Arc<Network>>,
     dropped: bool,
+    #[cfg(test)]
+    pub(crate) log_consumers_started: bool,
     #[cfg(feature = "host-port-exposure")]
     host_port_exposure: Option<HostPortExposure>,
     #[cfg(feature = "reusable-containers")]
@@ -91,9 +93,11 @@ where
             .unwrap_or(std::time::Duration::from_secs(60))
     }
 
-    pub(crate) async fn start_until_ready(&self) -> Result<()> {
+    pub(crate) async fn start_until_ready(&mut self) -> Result<()> {
         self.docker_client().start_container(self.id()).await?;
-        self.wait_until_ready(self.image.ready_conditions()).await?;
+        let ready_conditions = self.image.ready_conditions();
+        self.start_log_consumers();
+        self.wait_until_ready(ready_conditions).await?;
         let state = ContainerState::from_container(self).await?;
         for cmd in self.image().exec_after_start(state)? {
             self.exec(cmd).await?;
@@ -135,6 +139,8 @@ where
             image: container_req,
             network,
             dropped: false,
+            #[cfg(test)]
+            log_consumers_started: false,
             #[cfg(feature = "host-port-exposure")]
             host_port_exposure,
             #[cfg(feature = "reusable-containers")]
@@ -143,6 +149,10 @@ where
     }
 
     pub(crate) fn start_log_consumers(&mut self) {
+        #[cfg(test)]
+        {
+            self.log_consumers_started = true;
+        }
         let log_consumers = std::mem::take(&mut self.image.log_consumers);
         let container = &*self;
         if !log_consumers.is_empty() {

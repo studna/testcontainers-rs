@@ -3,7 +3,7 @@ pub(crate) mod async_runner;
 
 pub use self::{
     async_builder::AsyncBuilder,
-    async_runner::{AsyncRunner, StartupOwner},
+    async_runner::{AsyncRunner, StartupOwner, StartupSnapshot},
 };
 
 #[cfg(feature = "blocking")]
