@@ -272,6 +272,13 @@ where
                         status_code: 404, ..
                     },
                 )) => {
+                    #[cfg(feature = "ownership-observe")]
+                    crate::ownership_observe::record(
+                        crate::ownership_observe::Kind::ExactId404,
+                        self.id(),
+                        None,
+                        Some(self.dropped),
+                    );
                     self.dropped = true;
                     #[cfg(feature = "watchdog")]
                     crate::watchdog::unregister(self.id());
@@ -330,6 +337,13 @@ where
     I: Image,
 {
     fn drop(&mut self) {
+        #[cfg(feature = "ownership-observe")]
+        crate::ownership_observe::record(
+            crate::ownership_observe::Kind::ActualDrop,
+            self.id(),
+            None,
+            Some(self.dropped),
+        );
         #[cfg(feature = "reusable-containers")]
         {
             use crate::ReuseDirective::{Always, CurrentSession};
@@ -370,6 +384,13 @@ where
                 log::debug!("Container {id} was successfully dropped");
             };
 
+            #[cfg(feature = "ownership-observe")]
+            crate::ownership_observe::record(
+                crate::ownership_observe::Kind::AsyncDropDispatch,
+                self.id(),
+                None,
+                Some(self.dropped),
+            );
             async_drop::async_drop(drop_task);
         }
     }

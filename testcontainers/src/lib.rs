@@ -84,6 +84,8 @@
 //! [`testcontainers-modules`]: https://crates.io/crates/testcontainers-modules
 
 pub mod core;
+#[cfg(feature = "ownership-observe")]
+pub mod ownership_observe;
 #[cfg(feature = "blocking")]
 #[cfg_attr(docsrs, doc(cfg(feature = "blocking")))]
 pub use crate::core::Container;

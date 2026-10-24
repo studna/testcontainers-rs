@@ -271,6 +271,15 @@ impl<I: Image> StartupOwner<I> {
             .owner
             .take()
             .ok_or_else(|| crate::TestcontainersError::other("owner already taken"));
+        #[cfg(feature = "ownership-observe")]
+        if let Ok(actual) = &owner {
+            crate::ownership_observe::record(
+                crate::ownership_observe::Kind::Transfer,
+                actual.id(),
+                Some(&state.token),
+                None,
+            );
+        }
         state.publish();
         owner
     }
@@ -371,6 +380,13 @@ impl<I: Image> StartupState<I> {
             #[cfg(feature = "host-port-exposure")]
             self.exposure.take(),
         ));
+        #[cfg(feature = "ownership-observe")]
+        crate::ownership_observe::record(
+            crate::ownership_observe::Kind::Install,
+            self.owner.as_ref().expect("stored owner").id(),
+            Some(&self.token),
+            None,
+        );
     }
 
     async fn start_retained(&mut self) -> Result<()> {
