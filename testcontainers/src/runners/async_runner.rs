@@ -76,13 +76,334 @@ where
     I: Image,
 {
     async fn start(self) -> Result<ContainerAsync<I>> {
-        #[allow(unused_mut)]
-        let mut container_req = self.into();
+        let mut state = StartupState::new(self.into());
+        let container_id = state.create(false).await?;
+        if let Some(container) = state.owner.take() {
+            return Ok(container);
+        }
+        let container_req = state.request.take().expect("legacy request");
+        let client = state.client.take().expect("initialized client");
+        let network = state.network.take();
+        #[cfg(feature = "host-port-exposure")]
+        let host_port_exposure = state.exposure.take();
+
+        let copy_to_sources: Vec<&CopyToContainer> = container_req.copy_to_sources().collect();
+
+        for copy_to_source in copy_to_sources {
+            client
+                .copy_to_container(&container_id, copy_to_source)
+                .await?;
+        }
+
+        #[cfg(feature = "watchdog")]
+        if client.config.command() == crate::core::env::Command::Remove {
+            crate::watchdog::register(container_id.clone());
+        }
+
+        let startup_timeout = container_req
+            .startup_timeout()
+            .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
+
+        tokio::time::timeout(startup_timeout, async {
+            client.start_container(&container_id).await?;
+
+            let container = ContainerAsync::new(
+                container_id,
+                client.clone(),
+                container_req,
+                network,
+                #[cfg(feature = "host-port-exposure")]
+                host_port_exposure,
+            )
+            .await?;
+
+            let state = ContainerState::from_container(&container).await?;
+            for cmd in container.image().exec_after_start(state)? {
+                container.exec(cmd).await?;
+            }
+
+            Ok(container)
+        })
+        .await
+        .map_err(|_| WaitContainerError::StartupTimeout)?
+    }
+
+    async fn pull_image(self) -> Result<ContainerRequest<I>> {
+        let container_req = self.into();
+        let client = Client::lazy_client().await?;
+        client
+            .pull_image(
+                &container_req.descriptor(),
+                container_req.platform().clone(),
+            )
+            .await?;
+
+        Ok(container_req)
+    }
+}
+
+const OWNER_LABEL: &str = "org.testcontainers.startup-owner";
+
+/// Shared custody of one startup. Register this synchronously before spawning `run`.
+/// Retain and join that original task on its original runtime; never abort `run`.
+/// Join startup and close all dependent pools before calling `take_ready` or cleanup.
+pub struct StartupOwner<I: Image>(std::sync::Arc<tokio::sync::Mutex<StartupState<I>>>);
+
+impl<I: Image> Clone for StartupOwner<I> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+struct StartupState<I: Image> {
+    request: Option<ContainerRequest<I>>,
+    client: Option<std::sync::Arc<Client>>,
+    network: Option<std::sync::Arc<Network>>,
+    #[cfg(feature = "host-port-exposure")]
+    exposure: Option<HostPortExposure>,
+    owner: Option<ContainerAsync<I>>,
+    id: Option<String>,
+    name: String,
+    token: String,
+    submitted: bool,
+    collision: bool,
+    started: bool,
+    phase: &'static str,
+    deadline: Option<tokio::time::Instant>,
+    failure: Option<std::sync::Arc<crate::TestcontainersError>>,
+}
+
+impl<I: Image> StartupOwner<I> {
+    /// Reserve a fresh UUID name/token without starting any asynchronous effect.
+    pub fn new(mut request: ContainerRequest<I>) -> Self {
+        let token = uuid::Uuid::new_v4().to_string();
+        let name = format!(
+            "{}-{token}",
+            request
+                .container_name
+                .as_deref()
+                .unwrap_or("testcontainers")
+        );
+        request.container_name = Some(name.clone());
+        request.labels.insert(OWNER_LABEL.into(), token.clone());
+        let mut state = StartupState::new(request);
+        state.name = name;
+        state.token = token;
+        Self(std::sync::Arc::new(tokio::sync::Mutex::new(state)))
+    }
+
+    /// Execute once. Observer expiry must stop borrowing the join, never this future.
+    pub async fn run(&self) -> Result<()> {
+        let mut state = self
+            .0
+            .try_lock()
+            .map_err(|_| crate::TestcontainersError::other("startup busy"))?;
+        if state.started {
+            return Err(crate::TestcontainersError::other("startup already used"));
+        }
+        state.started = true;
+        state.phase = "creating";
+        let result = state.start_retained().await;
+        match result {
+            Ok(()) => {
+                state.phase = "ready";
+                Ok(())
+            }
+            Err(error) => {
+                state.collision |= matches!(
+                    &error,
+                    crate::TestcontainersError::Client(ClientError::CreateContainer(
+                        bollard::errors::Error::DockerResponseServerError {
+                            status_code: 409,
+                            ..
+                        }
+                    ))
+                );
+                let error = state
+                    .failure
+                    .get_or_insert_with(|| std::sync::Arc::new(error))
+                    .clone();
+                Err(crate::TestcontainersError::other(error))
+            }
+        }
+    }
+
+    /// Transfer the same owner once, after the caller has joined successful startup.
+    pub async fn take_ready(&self) -> Result<ContainerAsync<I>> {
+        let mut state = self
+            .0
+            .try_lock()
+            .map_err(|_| crate::TestcontainersError::other("startup busy"))?;
+        if state.phase != "ready" || state.failure.is_some() {
+            return Err(crate::TestcontainersError::other(
+                "startup not successfully joined",
+            ));
+        }
+        state.phase = "transferred";
+        state
+            .owner
+            .take()
+            .ok_or_else(|| crate::TestcontainersError::other("owner already taken"))
+    }
+
+    /// Retire only confirmed absence. Submitted unknown/name404 remains pending.
+    /// Retain this cleanup future across observer expiry, just as for `run`.
+    pub async fn close_retained(&self) -> Result<bool> {
+        let Ok(mut state) = self.0.try_lock() else {
+            return Ok(false);
+        };
+        if state.phase != "transferred" && state.phase != "retired" {
+            state.phase = "closing"; // Cancellation/panic must revoke ready transfer too.
+        }
+        let result = state.close().await;
+        if let Err(error) = result {
+            let error = state
+                .failure
+                .get_or_insert_with(|| std::sync::Arc::new(error))
+                .clone();
+            return Err(crate::TestcontainersError::other(error));
+        }
+        result
+    }
+}
+
+impl<I: Image> StartupState<I> {
+    fn new(request: ContainerRequest<I>) -> Self {
+        Self {
+            request: Some(request),
+            client: None,
+            network: None,
+            #[cfg(feature = "host-port-exposure")]
+            exposure: None,
+            owner: None,
+            id: None,
+            name: String::new(),
+            token: String::new(),
+            submitted: false,
+            collision: false,
+            started: false,
+            phase: "new",
+            deadline: None,
+            failure: None,
+        }
+    }
+
+    fn install_owner(&mut self) {
+        self.owner = Some(ContainerAsync::construct_owner(
+            self.id.clone().expect("acknowledged ID"),
+            self.client.as_ref().expect("submitted client").clone(),
+            self.request.take().expect("retained request"),
+            self.network.take(),
+            #[cfg(feature = "host-port-exposure")]
+            self.exposure.take(),
+        ));
+    }
+
+    async fn start_retained(&mut self) -> Result<()> {
+        #[cfg(feature = "reusable-containers")]
+        if self.request.as_ref().expect("request").reuse() != crate::ReuseDirective::Never {
+            return Err(crate::TestcontainersError::other(
+                "retained startup forbids reuse",
+            ));
+        }
+        self.create(true).await?;
+        self.install_owner(); // No suspension or user callback between ACK and custody.
+        self.phase = "copying";
+        let owner = self.owner.as_mut().expect("registered actual owner");
+        owner.start_log_consumers();
+        owner.copy_to_container().await?;
+        #[cfg(feature = "watchdog")]
+        if owner.docker_client().config.command() == crate::core::env::Command::Remove {
+            crate::watchdog::register(owner.id().to_string());
+        }
+        self.phase = "readiness";
+        let timeout = owner.startup_timeout();
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.deadline = Some(deadline);
+        let readiness = owner.start_until_ready();
+        tokio::pin!(readiness);
+        match tokio::time::timeout_at(deadline, &mut readiness).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.failure = Some(std::sync::Arc::new(
+                    WaitContainerError::StartupTimeout.into(),
+                ));
+                let _ = readiness.await; // Same pinned future, reactor and deadline; no restart.
+                Err(WaitContainerError::StartupTimeout.into())
+            }
+        }
+    }
+
+    async fn close(&mut self) -> Result<bool> {
+        if self.phase == "retired" {
+            return Ok(true);
+        }
+        if self.phase == "transferred" || self.collision {
+            return Ok(false);
+        }
+        if self.owner.is_none() && self.submitted {
+            let client = self.client.as_ref().expect("submitted client");
+            match client.inspect(&self.name).await {
+                Ok(info) => {
+                    let labels = info
+                        .config
+                        .and_then(|config| config.labels)
+                        .unwrap_or_default();
+                    if labels.get(OWNER_LABEL) != Some(&self.token)
+                        || info.name.as_deref() != Some(&format!("/{}", self.name))
+                        || info.id.as_ref().is_none_or(String::is_empty)
+                    {
+                        return Ok(false);
+                    }
+                    self.id = info.id;
+                    self.install_owner(); // Store actual recovered owner before the next await.
+                }
+                Err(ClientError::InspectContainer(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404, ..
+                    },
+                )) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(owner) = self.owner.as_mut() {
+            owner.rm_retained().await?;
+        }
+        self.owner.take(); // Disarmed by exact ID404, on this original caller reactor.
+        self.started = true;
+        self.phase = "retired";
+        Ok(true)
+    }
+
+    async fn create(&mut self, retained: bool) -> Result<String> {
+        let container_req = self
+            .request
+            .as_mut()
+            .expect("request retained until create ACK");
 
         #[cfg(feature = "host-port-exposure")]
-        let host_port_exposure = HostPortExposure::setup(&mut container_req).await?;
+        {
+            self.exposure = HostPortExposure::setup(container_req).await?;
+        }
 
         let client = Client::lazy_client().await?;
+        self.client = Some(client.clone());
+        if retained {
+            match client.inspect(&self.name).await {
+                Err(ClientError::InspectContainer(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404, ..
+                    },
+                )) => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    self.collision = true;
+                    return Err(crate::TestcontainersError::other(
+                        "reserved name already exists",
+                    ));
+                }
+            }
+        }
         let mut create_options: Option<CreateContainerOptions> = None;
 
         let extra_hosts: Vec<_> = container_req
@@ -123,7 +444,7 @@ where
                 TestcontainersError,
             };
 
-            if matches!(container_req.reuse(), Always | CurrentSession) {
+            if !retained && matches!(container_req.reuse(), Always | CurrentSession) {
                 if labels.is_empty() && container_req.container_name().is_none() {
                     return Err(TestcontainersError::Client(ClientError::Configuration(
                         ConfigurationError::MissingContainerNameAndLabels,
@@ -149,14 +470,16 @@ where
                         None
                     };
 
-                    return Ok(ContainerAsync::construct(
-                        container_info.id,
+                    let id = container_info.id;
+                    self.owner = Some(ContainerAsync::construct(
+                        id.clone(),
                         client,
-                        container_req,
+                        self.request.take().expect("unconsumed reuse request"),
                         network,
                         #[cfg(feature = "host-port-exposure")]
-                        host_port_exposure,
+                        self.exposure.take(),
                     ));
+                    return Ok(id);
                 }
             }
         }
@@ -204,6 +527,7 @@ where
             None
         };
 
+        self.network = network;
         let mut options_builder: Option<CreateContainerOptionsBuilder> = None;
 
         // name of the container
@@ -339,7 +663,8 @@ where
             config.cmd = Some(cmd);
         }
 
-        // create the container with options
+        // The submitted bit is durable before either POST is first polled.
+        self.submitted = true;
         let create_result = client
             .create_container(create_options.clone(), config.clone())
             .await;
@@ -350,69 +675,31 @@ where
                     status_code: 404, ..
                 },
             )) => {
+                self.submitted = false; // A joined image-not-found reply is definitive.
                 client
                     .pull_image(
                         &container_req.descriptor(),
                         container_req.platform().clone(),
                     )
                     .await?;
+                self.submitted = true;
                 client.create_container(create_options, config).await
             }
-            res => res,
-        }?;
-
-        let copy_to_sources: Vec<&CopyToContainer> = container_req.copy_to_sources().collect();
-
-        for copy_to_source in copy_to_sources {
-            client
-                .copy_to_container(&container_id, copy_to_source)
-                .await?;
-        }
-
-        #[cfg(feature = "watchdog")]
-        if client.config.command() == crate::core::env::Command::Remove {
-            crate::watchdog::register(container_id.clone());
-        }
-
-        let startup_timeout = container_req
-            .startup_timeout()
-            .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
-
-        tokio::time::timeout(startup_timeout, async {
-            client.start_container(&container_id).await?;
-
-            let container = ContainerAsync::new(
-                container_id,
-                client.clone(),
-                container_req,
-                network,
-                #[cfg(feature = "host-port-exposure")]
-                host_port_exposure,
-            )
-            .await?;
-
-            let state = ContainerState::from_container(&container).await?;
-            for cmd in container.image().exec_after_start(state)? {
-                container.exec(cmd).await?;
+            Err(error) => {
+                self.collision = matches!(
+                    &error,
+                    ClientError::CreateContainer(
+                        bollard::errors::Error::DockerResponseServerError {
+                            status_code: 409,
+                            ..
+                        }
+                    )
+                );
+                Err(error)
             }
-
-            Ok(container)
-        })
-        .await
-        .map_err(|_| WaitContainerError::StartupTimeout)?
-    }
-
-    async fn pull_image(self) -> Result<ContainerRequest<I>> {
-        let container_req = self.into();
-        let client = Client::lazy_client().await?;
-        client
-            .pull_image(
-                &container_req.descriptor(),
-                container_req.platform().clone(),
-            )
-            .await?;
-
-        Ok(container_req)
+        }?;
+        self.id = Some(container_id.clone());
+        Ok(container_id)
     }
 }
 

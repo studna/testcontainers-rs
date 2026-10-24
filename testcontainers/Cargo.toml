@@ -49,7 +49,7 @@ astral-tokio-tar = "0.6.0"
 tokio-util = { version = "0.7.10", features = ["io"] }
 ferroid = { version = "2.0.0", features = ["std", "ulid", "base32"] }
 url = { version = "2", features = ["serde"] }
-uuid = { version = "1.8.0", features = ["v4"], optional = true }
+uuid = { version = "1.8.0", features = ["v4"] }
 
 [features]
 default = ["ring"]
@@ -64,7 +64,7 @@ properties-config = ["serde-java-properties"]
 reusable-containers = []
 device-requests = []
 host-port-exposure = ["dep:russh", "russh/ring"]
-docker-compose = ["dep:docker-compose-types", "dep:uuid"]
+docker-compose = ["dep:docker-compose-types"]
 
 [dev-dependencies]
 anyhow = "1.0.86"

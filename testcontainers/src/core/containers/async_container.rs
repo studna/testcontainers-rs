@@ -7,7 +7,7 @@ use super::host::HostPortExposure;
 use crate::{
     core::{
         async_drop, client::Client, copy::CopyFileFromContainer, env, error::Result,
-        network::Network, ContainerState,
+        network::Network, ContainerState, WaitFor,
     },
     ContainerRequest, Image,
 };
@@ -55,6 +55,7 @@ where
         network: Option<Arc<Network>>,
         #[cfg(feature = "host-port-exposure")] host_port_exposure: Option<HostPortExposure>,
     ) -> Result<ContainerAsync<I>> {
+        let ready_conditions = container_req.ready_conditions();
         let container = Self::construct(
             id,
             docker_client,
@@ -63,12 +64,11 @@ where
             #[cfg(feature = "host-port-exposure")]
             host_port_exposure,
         );
-        container.wait_until_ready().await?;
+        container.wait_until_ready(ready_conditions).await?;
         Ok(container)
     }
 
-    pub(crate) async fn wait_until_ready(&self) -> Result<()> {
-        let ready_conditions = self.image.ready_conditions();
+    pub(crate) async fn wait_until_ready(&self, ready_conditions: Vec<WaitFor>) -> Result<()> {
         let state = ContainerState::from_container(self).await?;
         for cmd in self.image().exec_before_ready(state)? {
             self.exec(cmd).await?;
@@ -78,14 +78,22 @@ where
 
     pub(crate) async fn copy_to_container(&self) -> Result<()> {
         for source in self.image.copy_to_sources() {
-            self.docker_client().copy_to_container(self.id(), source).await?;
+            self.docker_client()
+                .copy_to_container(self.id(), source)
+                .await?;
         }
         Ok(())
     }
 
+    pub(crate) fn startup_timeout(&self) -> std::time::Duration {
+        self.image
+            .startup_timeout()
+            .unwrap_or(std::time::Duration::from_secs(60))
+    }
+
     pub(crate) async fn start_until_ready(&self) -> Result<()> {
         self.docker_client().start_container(self.id()).await?;
-        self.wait_until_ready().await?;
+        self.wait_until_ready(self.image.ready_conditions()).await?;
         let state = ContainerState::from_container(self).await?;
         for cmd in self.image().exec_after_start(state)? {
             self.exec(cmd).await?;
@@ -96,15 +104,33 @@ where
     pub(crate) fn construct(
         id: String,
         docker_client: Arc<Client>,
-        mut container_req: ContainerRequest<I>,
+        container_req: ContainerRequest<I>,
+        network: Option<Arc<Network>>,
+        #[cfg(feature = "host-port-exposure")] host_port_exposure: Option<HostPortExposure>,
+    ) -> ContainerAsync<I> {
+        let mut container = Self::construct_owner(
+            id,
+            docker_client,
+            container_req,
+            network,
+            #[cfg(feature = "host-port-exposure")]
+            host_port_exposure,
+        );
+        container.start_log_consumers();
+        container
+    }
+
+    pub(crate) fn construct_owner(
+        id: String,
+        docker_client: Arc<Client>,
+        container_req: ContainerRequest<I>,
         network: Option<Arc<Network>>,
         #[cfg(feature = "host-port-exposure")] host_port_exposure: Option<HostPortExposure>,
     ) -> ContainerAsync<I> {
         #[cfg(feature = "reusable-containers")]
         let reuse = container_req.reuse();
 
-        let log_consumers = std::mem::take(&mut container_req.log_consumers);
-        let container = ContainerAsync {
+        ContainerAsync {
             raw: raw::RawContainer::new(id, docker_client),
             image: container_req,
             network,
@@ -113,8 +139,12 @@ where
             host_port_exposure,
             #[cfg(feature = "reusable-containers")]
             reuse,
-        };
+        }
+    }
 
+    pub(crate) fn start_log_consumers(&mut self) {
+        let log_consumers = std::mem::take(&mut self.image.log_consumers);
+        let container = &*self;
         if !log_consumers.is_empty() {
             let mut logs = container.docker_client().logs(container.id(), true);
             let container_id = container.id().to_string();
@@ -136,8 +166,6 @@ where
                 }
             });
         }
-
-        container
     }
 
     /// Returns a reference to the [`Image`] of this container.
@@ -229,7 +257,9 @@ where
         for attempt in 0..2 {
             match self.docker_client().inspect(self.id()).await {
                 Err(ClientError::InspectContainer(
-                    bollard::errors::Error::DockerResponseServerError { status_code: 404, .. },
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404, ..
+                    },
                 )) => {
                     self.dropped = true;
                     #[cfg(feature = "watchdog")]
@@ -241,7 +271,7 @@ where
                 Ok(_) => return Err(TestcontainersError::other("removed container still exists")),
             }
         }
-        unreachable!("two inspect attempts return or remove then return")
+        Err(TestcontainersError::other("removed container still exists"))
     }
 
     /// Removes the container.
