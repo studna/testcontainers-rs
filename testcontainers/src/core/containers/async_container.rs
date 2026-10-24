@@ -55,7 +55,6 @@ where
         network: Option<Arc<Network>>,
         #[cfg(feature = "host-port-exposure")] host_port_exposure: Option<HostPortExposure>,
     ) -> Result<ContainerAsync<I>> {
-        let ready_conditions = container_req.ready_conditions();
         let container = Self::construct(
             id,
             docker_client,
@@ -64,12 +63,34 @@ where
             #[cfg(feature = "host-port-exposure")]
             host_port_exposure,
         );
-        let state = ContainerState::from_container(&container).await?;
-        for cmd in container.image().exec_before_ready(state)? {
-            container.exec(cmd).await?;
-        }
-        container.block_until_ready(ready_conditions).await?;
+        container.wait_until_ready().await?;
         Ok(container)
+    }
+
+    pub(crate) async fn wait_until_ready(&self) -> Result<()> {
+        let ready_conditions = self.image.ready_conditions();
+        let state = ContainerState::from_container(self).await?;
+        for cmd in self.image().exec_before_ready(state)? {
+            self.exec(cmd).await?;
+        }
+        self.block_until_ready(ready_conditions).await
+    }
+
+    pub(crate) async fn copy_to_container(&self) -> Result<()> {
+        for source in self.image.copy_to_sources() {
+            self.docker_client().copy_to_container(self.id(), source).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn start_until_ready(&self) -> Result<()> {
+        self.docker_client().start_container(self.id()).await?;
+        self.wait_until_ready().await?;
+        let state = ContainerState::from_container(self).await?;
+        for cmd in self.image().exec_after_start(state)? {
+            self.exec(cmd).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn construct(
@@ -199,6 +220,28 @@ where
     {
         let container_path = container_path.into();
         self.raw.copy_file_from(container_path, target).await
+    }
+
+    /// Removes this exact container, retaining ownership on error or cancellation.
+    /// Only an inspect 404 disarms its destructor. Callers must latch every error.
+    pub async fn rm_retained(&mut self) -> Result<()> {
+        use crate::core::error::{ClientError, TestcontainersError};
+        for attempt in 0..2 {
+            match self.docker_client().inspect(self.id()).await {
+                Err(ClientError::InspectContainer(
+                    bollard::errors::Error::DockerResponseServerError { status_code: 404, .. },
+                )) => {
+                    self.dropped = true;
+                    #[cfg(feature = "watchdog")]
+                    crate::watchdog::unregister(self.id());
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) if attempt == 0 => self.docker_client().rm(self.id()).await?,
+                Ok(_) => return Err(TestcontainersError::other("removed container still exists")),
+            }
+        }
+        unreachable!("two inspect attempts return or remove then return")
     }
 
     /// Removes the container.
