@@ -2,7 +2,7 @@
 //! Engine IDs join actual owners across moves to Install/Transfer owner tokens and
 //! StartupOwner snapshots. No pointer identity or ownership substitution is used.
 use std::{
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     thread::{self, ThreadId},
 };
 
@@ -32,7 +32,8 @@ pub struct Event {
     /// Present on Install/Transfer; join subsequent events by exact Engine ID.
     pub token: Option<String>,
     pub runtime: Option<Id>,
-    pub flavor: Option<RuntimeFlavor>,
+    /// Shared verbatim: Tokio flavors are non-Clone and may gain unknown variants.
+    pub flavor: Option<Arc<RuntimeFlavor>>,
     pub thread: ThreadId,
     pub disarmed: Option<bool>,
 }
@@ -77,7 +78,9 @@ pub(crate) fn record(kind: Kind, id: &str, token: Option<&str>, disarmed: Option
         id: id.into(),
         token: token.map(str::to_owned),
         runtime: handle.as_ref().map(Handle::id),
-        flavor: handle.as_ref().map(Handle::runtime_flavor),
+        flavor: handle
+            .as_ref()
+            .map(|handle| Arc::new(handle.runtime_flavor())),
         thread: thread::current().id(),
         disarmed,
     };
@@ -127,7 +130,19 @@ mod tests {
                 let event = invocation[0];
                 assert_eq!(event.kind, Kind::AsyncDropEntry);
                 assert_eq!(event.thread, thread::current().id());
-                assert_eq!(event.flavor, Some(handle.runtime_flavor()));
+                assert_eq!(event.flavor.as_deref(), Some(&handle.runtime_flavor()));
+                let cloned = event.clone();
+                assert!(Arc::ptr_eq(
+                    event.flavor.as_ref().unwrap(),
+                    cloned.flavor.as_ref().unwrap(),
+                ));
+                assert_eq!(cloned.seq, event.seq);
+                assert_eq!(cloned.kind, event.kind);
+                assert_eq!(cloned.id, event.id);
+                assert_eq!(cloned.token, event.token);
+                assert_eq!(cloned.runtime, event.runtime);
+                assert_eq!(cloned.thread, event.thread);
+                assert_eq!(cloned.disarmed, event.disarmed);
                 assert!(event.id.is_empty());
                 assert!(event.token.is_none());
                 assert!(event.disarmed.is_none());
