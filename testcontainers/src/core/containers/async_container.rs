@@ -351,7 +351,7 @@ where
             if !self.dropped && matches!(self.reuse, Always | CurrentSession) {
                 log::debug!(
                     "Declining to reap container marked for reuse: {}",
-                    &self.id()
+                    self.id()
                 );
 
                 return;
