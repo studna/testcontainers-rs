@@ -1876,7 +1876,7 @@ mod retained_api_tests {
             json!({"HostConfig": {"VolumeDriver": "local"}}),
             json!({"HostConfig": {"Runtime": "runc"}}),
             json!({"HostConfig": {"StorageOpt": {}}}),
-            json!({"Volumes": ["/data"]}),
+            json!({"Volumes": {"/data": {}}}),
             json!({"HostConfig": {"NetworkMode": "bridge"}}),
             json!({"NetworkingConfig": {}}),
             json!({"Image": null}),
@@ -1989,7 +1989,7 @@ mod retained_api_tests {
                 None
             );
             for patch in [
-                json!({"Volumes":["/data"]}),
+                json!({"Volumes":{"/data":{}}}),
                 json!({"NetworkingConfig":{}}),
                 json!({"Image":null}),
                 json!({"HostConfig":{"Mounts":[{}]}}),
