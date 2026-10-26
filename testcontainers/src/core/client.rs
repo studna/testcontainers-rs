@@ -389,6 +389,15 @@ impl Client {
             .map_err(ClientError::InspectNetwork)
     }
 
+    // Compatibility evidence from THIS client, before POST and after its reply.
+    // Genuine unchanged endpoint + one stable daemon are trust premises, shared
+    // with ordinary Engine physical observations; INFO/version authenticate nothing.
+    pub(crate) async fn create_provenance(&self) -> Option<CreateProvenance> {
+        let version = self.bollard.version().await.ok()?;
+        let info = self.bollard.info().await.ok()?;
+        CreateProvenance::from_records(&version, &info)
+    }
+
     pub(crate) async fn create_container(
         &self,
         options: Option<CreateContainerOptions>,
@@ -862,6 +871,62 @@ where
     }
 }
 
+// Conditional closure: pinned Linux Moby, built-in CLASSIC overlay2, no
+// containerd snapshotter, and the complete safe final request subset at BOTH
+// status boundaries. The exact observed xfs/native-diff subset is deliberately
+// narrower than every possible classic configuration. Unknown/extra/duplicate
+// status rows fail closed; a matching body cannot establish endpoint trust.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreateProvenance {
+    daemon_id: String,
+}
+impl CreateProvenance {
+    pub(crate) fn from_records(
+        version: &bollard::models::SystemVersion,
+        info: &bollard::models::SystemInfo,
+    ) -> Option<Self> {
+        if !known_create_version(version)
+            || info.os_type.as_deref() != Some("linux")
+            || info.server_version.as_deref() != Some("28.0.1")
+            || info.driver.as_deref() != Some("overlay2")
+        {
+            return None;
+        }
+        let expected = [
+            ("Backing Filesystem", "xfs"),
+            ("Supports d_type", "true"),
+            ("Using metacopy", "false"),
+            ("Native Overlay Diff", "true"),
+            ("userxattr", "false"),
+        ];
+        let rows = info.driver_status.as_ref()?;
+        if rows.len() != expected.len()
+            || expected.iter().any(|(key, value)| {
+                rows.iter()
+                    .filter(|row| row.len() == 2 && row[0] == *key && row[1] == *value)
+                    .count()
+                    != 1
+            })
+        {
+            return None;
+        }
+        let id = info.id.as_deref()?;
+        if id.is_empty() || id.len() > 256 || !id.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return None;
+        }
+        Some(Self {
+            daemon_id: id.into(),
+        })
+    }
+}
+
+fn known_create_version(version: &bollard::models::SystemVersion) -> bool {
+    version.version.as_deref() == Some("28.0.1")
+        && version.git_commit.as_deref() == Some("bbd0a17")
+        && version.os.as_deref() == Some("linux")
+        && version.api_version.as_deref() == Some("1.48")
+}
+
 /// Docker Hub's canonical registry hostname, used for credential lookups when
 /// an image descriptor has no explicit registry prefix (e.g. `postgres:16`).
 const DOCKER_HUB_REGISTRY: &str = "index.docker.io";
@@ -886,6 +951,83 @@ mod tests {
     use bollard::query_parameters::RemoveImageOptions;
 
     use super::*;
+
+    #[test]
+    fn create_version_requires_every_audited_field() {
+        let known = serde_json::json!({
+            "Version": "28.0.1", "GitCommit": "bbd0a17", "Os": "linux", "ApiVersion": "1.48"
+        });
+        let fingerprint = |value| known_create_version(&serde_json::from_value(value).unwrap());
+        assert!(fingerprint(known.clone()));
+        for field in ["Version", "GitCommit", "Os", "ApiVersion"] {
+            for replacement in [Some("unsupported"), Some(""), None] {
+                let mut unknown = known.clone();
+                unknown[field] = replacement.into();
+                assert!(!fingerprint(unknown));
+            }
+            let mut missing = known.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!fingerprint(missing));
+        }
+    }
+
+    #[test]
+    fn classic_profile_excludes_containerd_unknown_and_mismatched_records() {
+        use serde_json::json;
+        let version =
+            json!({"Version":"28.0.1","GitCommit":"bbd0a17","Os":"linux","ApiVersion":"1.48"});
+        let info = json!({"ID":"daemon-a","OSType":"linux","ServerVersion":"28.0.1","Driver":"overlay2",
+            "DriverStatus":[["Backing Filesystem","xfs"],["Supports d_type","true"],["Using metacopy","false"],
+                ["Native Overlay Diff","true"],["userxattr","false"]]});
+        let decode = |version: serde_json::Value, info: serde_json::Value| {
+            CreateProvenance::from_records(
+                &serde_json::from_value(version).unwrap(),
+                &serde_json::from_value(info).unwrap(),
+            )
+        };
+        let positive = decode(version.clone(), info.clone()).expect("current classic subset");
+        for field in ["ID", "OSType", "ServerVersion", "Driver", "DriverStatus"] {
+            let mut missing = info.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(decode(version.clone(), missing).is_none(), "{field}");
+            let mut null = info.clone();
+            null[field] = serde_json::Value::Null;
+            assert!(decode(version.clone(), null).is_none(), "{field}");
+        }
+        for (field, value) in [
+            ("ID", json!("")),
+            ("Driver", json!("overlayfs")),
+            ("OSType", json!("windows")),
+            ("ServerVersion", json!("28.0.2")),
+            ("DriverStatus", json!([])),
+        ] {
+            let mut bad = info.clone();
+            bad[field] = value;
+            assert!(decode(version.clone(), bad).is_none());
+        }
+        for index in 0..5 {
+            let mut bad = info.clone();
+            bad["DriverStatus"][index][1] = json!("unknown");
+            assert!(decode(version.clone(), bad).is_none());
+            let mut bad = info.clone();
+            bad["DriverStatus"][index] = json!(["driver-type", "io.containerd.snapshotter.v1"]);
+            assert!(decode(version.clone(), bad).is_none());
+        }
+        for row in [
+            json!(["driver-type", "io.containerd.snapshotter.v1"]),
+            info["DriverStatus"][0].clone(),
+        ] {
+            let mut bad = info.clone();
+            bad["DriverStatus"].as_array_mut().unwrap().push(row);
+            assert!(decode(version.clone(), bad).is_none());
+        }
+        let mut changed = info.clone();
+        changed["ID"] = json!("daemon-b");
+        assert_ne!(Some(positive), decode(version.clone(), changed));
+        let mut wrong_version = version.clone();
+        wrong_version["GitCommit"] = json!("unknown");
+        assert!(decode(wrong_version, info).is_none());
+    }
 
     #[derive(Debug)]
     struct OsEnvWithPlatformLinuxAmd64;

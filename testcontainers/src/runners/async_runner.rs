@@ -472,6 +472,29 @@ impl<I: Image> StartupState<I> {
         Ok(true)
     }
 
+    fn arm_create(&mut self) {
+        self.submitted = true;
+        self.publish();
+    }
+
+    fn collect_create_rejection(&mut self, rejection: Option<u16>) -> bool {
+        self.collision = rejection == Some(409);
+        if rejection.is_some() {
+            self.submitted = false;
+        }
+        self.publish();
+        rejection == Some(404)
+    }
+
+    async fn pull_before_retry(
+        &mut self,
+        pull: impl std::future::Future<Output = std::result::Result<(), ClientError>>,
+    ) -> Result<()> {
+        pull.await?; // A failed pull leaves the proposed no-submission publication intact.
+        self.arm_create(); // Rearm before the retry POST can be polled.
+        Ok(())
+    }
+
     async fn create(&mut self, retained: bool) -> Result<String> {
         let container_req = self
             .request
@@ -760,56 +783,74 @@ impl<I: Image> StartupState<I> {
             config.cmd = Some(cmd);
         }
 
-        let observed = self.observed.clone();
-        let publish_submission = |submitted| {
-            observed
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .submitted = submitted;
+        let unmodified =
+            container_req.host_config_modifier().is_none() && container_req.network().is_none();
+        // These records originate on this configured client. Comparing records is
+        // fail-closed compatibility checking, not authentication or proof against
+        // an endpoint being replaced. One trusted stable daemon is explicit.
+        let provenance = if retained {
+            client.create_provenance().await
+        } else {
+            None
         };
-        // The submitted bit is durable before either POST is first polled.
-        self.submitted = true;
-        publish_submission(true);
+        let rejection = |result: &std::result::Result<String, ClientError>, stable: bool| {
+            if retained {
+                admitted_create_rejection(
+                    result,
+                    stable,
+                    create_options.as_ref(),
+                    &config,
+                    unmodified,
+                )
+            } else {
+                match result {
+                    Err(ClientError::CreateContainer(
+                        bollard::errors::Error::DockerResponseServerError {
+                            status_code: code @ (404 | 409),
+                            ..
+                        },
+                    )) => Some(*code),
+                    _ => None,
+                }
+            }
+        };
+        self.arm_create(); // Publish before ORIGINAL POST is polled.
         let create_result = client
             .create_container(create_options.clone(), config.clone())
             .await;
-        let final_result = match create_result {
-            Ok(id) => Ok(id),
-            Err(ClientError::CreateContainer(
-                bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                },
-            )) => {
-                self.submitted = false; // A joined image-not-found reply is definitive.
-                publish_submission(false);
-                client
-                    .pull_image(
-                        &container_req.descriptor(),
-                        container_req.platform().clone(),
-                    )
-                    .await?;
-                self.submitted = true;
-                publish_submission(true);
-                client.create_container(create_options, config).await
-            }
-            other => other,
+        // Never insert an await after successful ACK before installing custody.
+        let stable = provenance.is_some()
+            && needs_noncreation_provenance(&create_result)
+            && client.create_provenance().await == provenance;
+        // Clear and publish certified noncreation BEFORE pulling or propagating.
+        let retry = self.collect_create_rejection(rejection(&create_result, stable));
+        let final_result = if retry {
+            let request = self
+                .request
+                .as_ref()
+                .expect("request retained until create ACK");
+            let descriptor = request.descriptor();
+            let platform = request.platform().clone();
+            self.pull_before_retry(client.pull_image(&descriptor, platform))
+                .await?;
+            // pull_before_retry rearms BEFORE either this await or the retry POST.
+            let retry_provenance = if retained {
+                client.create_provenance().await
+            } else {
+                None
+            };
+            let retry_result = client
+                .create_container(create_options.clone(), config.clone())
+                .await;
+            let stable = provenance.is_some()
+                && needs_noncreation_provenance(&retry_result)
+                && retry_provenance == provenance
+                && client.create_provenance().await == provenance;
+            self.collect_create_rejection(rejection(&retry_result, stable)); // BEFORE ?.
+            retry_result
+        } else {
+            create_result
         };
-        // This boundary sees only genuine POST replies, never a later Image callback error.
-        self.collision = create_collision(&final_result);
-        if self.collision
-            || matches!(
-                &final_result,
-                Err(ClientError::CreateContainer(
-                    bollard::errors::Error::DockerResponseServerError {
-                        status_code: 404,
-                        ..
-                    }
-                ))
-            )
-        {
-            self.submitted = false; // Joined409 or image404 certifies no creation by this POST.
-        }
-        publish_submission(self.submitted);
         let container_id = final_result?;
         self.id = Some(container_id.clone());
         self.publish();
@@ -817,6 +858,135 @@ impl<I: Image> StartupState<I> {
     }
 }
 
+fn needs_noncreation_provenance(result: &std::result::Result<String, ClientError>) -> bool {
+    matches!(
+        result,
+        Err(ClientError::CreateContainer(
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 404 | 409,
+                ..
+            }
+        ))
+    )
+}
+
+// Conditional immutable classic closure. This parser is entered ONLY at actual
+// initial/retry POST-result boundaries with matching pre/post compatibility
+// records from the configured trusted stable daemon. NOT body authentication.
+// Entire request exclusions apply to BOTH statuses, including409; otherwise a
+// late backend error could impersonate a canonical precommit diagnostic.
+fn admitted_create_rejection(
+    result: &std::result::Result<String, ClientError>,
+    stable_classic: bool,
+    options: Option<&CreateContainerOptions>,
+    config: &ContainerCreateBody,
+    unmodified: bool,
+) -> Option<u16> {
+    if !stable_classic || !safe_create_config(config, unmodified) {
+        return None;
+    }
+    canonical_create_rejection(result, options, config)
+}
+
+fn safe_create_config(config: &ContainerCreateBody, unmodified: bool) -> bool {
+    unmodified
+        && config.image.is_some()
+        && config.volumes.as_ref().is_none_or(Vec::is_empty)
+        && config.networking_config.is_none()
+        && config.host_config.as_ref().is_none_or(|h| {
+            h.network_mode.is_none()
+                && h.mounts.as_ref().is_none_or(Vec::is_empty)
+                && h.binds.as_ref().is_none_or(Vec::is_empty)
+                && h.tmpfs.as_ref().is_none_or(HashMap::is_empty)
+                && h.volumes_from.as_ref().is_none_or(Vec::is_empty)
+                && h.devices.as_ref().is_none_or(Vec::is_empty)
+                && h.device_requests.as_ref().is_none_or(Vec::is_empty)
+                && h.volume_driver.is_none()
+                && h.runtime.is_none()
+                && h.storage_opt.is_none()
+        })
+}
+
+fn canonical_create_rejection(
+    result: &std::result::Result<String, ClientError>,
+    options: Option<&CreateContainerOptions>,
+    config: &ContainerCreateBody,
+) -> Option<u16> {
+    let Err(ClientError::CreateContainer(bollard::errors::Error::DockerResponseServerError {
+        status_code,
+        message,
+    })) = result
+    else {
+        return None;
+    };
+    if *status_code == 409 {
+        let name = options?.name.as_deref()?;
+        if !name.as_bytes().first()?.is_ascii_alphanumeric()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            return None;
+        }
+        let prefix =
+            format!("Conflict. The container name \"/{name}\" is already in use by container \"");
+        let id = message.strip_prefix(&prefix)?.strip_suffix(
+            "\". You have to remove (or rename) that container to be able to reuse that name.",
+        )?;
+        return (id.len() == 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then_some(409);
+    }
+    let image = config.image.as_deref()?;
+    let (base, tag) = image.split_once(':')?;
+    let simple = !base.is_empty()
+        && base
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && (1..=128).contains(&tag.len())
+        && tag
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
+    (*status_code == 404 && simple && message == &format!("No such image: {image}")).then_some(404)
+}
+
+// Exploratory shape checker preserved for review of the UNAPPLIED compact source.
+// Its tests are shape/component tests; neither production admission nor proof.
+#[cfg(test)]
+// Synthetic/captured shapes are kept for review of the rejected proposal only.
+// Even a genuine unchanged Engine can propagate a matching late dependency error.
+fn unproven_rejection_shape(
+    result: &std::result::Result<String, ClientError>,
+    known: bool,
+    options: Option<&CreateContainerOptions>,
+    config: &ContainerCreateBody,
+    unmodified: bool,
+) -> Option<u16> {
+    if !known {
+        return None;
+    }
+    if matches!(
+        result,
+        Err(ClientError::CreateContainer(
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                ..
+            }
+        ))
+    ) {
+        canonical_create_rejection(result, options, config)
+    } else {
+        admitted_create_rejection(result, known, options, config, unmodified)
+    }
+}
+
+#[cfg(test)]
 fn create_collision(result: &std::result::Result<String, ClientError>) -> bool {
     matches!(
         result,
@@ -1528,6 +1698,464 @@ mod retained_api_tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    fn reply(status_code: u16, message: &str) -> std::result::Result<String, ClientError> {
+        Err(ClientError::CreateContainer(
+            bollard::errors::Error::DockerResponseServerError {
+                status_code,
+                message: message.into(),
+            },
+        ))
+    }
+
+    fn conflict(name: &str, id: &str) -> String {
+        format!("Conflict. The container name \"/{name}\" is already in use by container \"{id}\". You have to remove (or rename) that container to be able to reuse that name.")
+    }
+
+    #[test]
+    fn retained_post_admission_stays_closed_pending_source_exclusivity() {
+        let config = ContainerCreateBody::default();
+        for status in 100..600 {
+            for message in ["No such image: postgres:11-alpine", "Conflict", ""] {
+                let result = Err(ClientError::CreateContainer(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: status,
+                        message: message.into(),
+                    },
+                ));
+                assert_eq!(
+                    admitted_create_rejection(&result, true, None, &config, true),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            admitted_create_rejection(&Ok("actual-id".into()), true, None, &config, true),
+            None
+        );
+    }
+
+    #[test]
+    fn source_countermodel_shapes_never_admit_retained_retirement_or_pull() {
+        // Synthetic component inputs represent the immutable SOURCE countermodel;
+        // this does not claim a stock/current host emitted either diagnostic.
+        let options = CreateContainerOptionsBuilder::new().name("audit").build();
+        let config = ContainerCreateBody {
+            image: Some("postgres:11-alpine".into()),
+            ..Default::default()
+        };
+        let diagnostic = conflict("audit", &"a".repeat(64));
+        for (status, message) in [
+            (404, "No such image: postgres:11-alpine"),
+            (409, diagnostic.as_str()),
+        ] {
+            let result = reply(status, message);
+            assert_eq!(
+                unproven_rejection_shape(&result, true, Some(&options), &config, true),
+                Some(status)
+            );
+            assert_eq!(
+                admitted_create_rejection(&result, false, Some(&options), &config, true),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn causal_rejection_requires_exact_post_diagnostic_and_request() {
+        let options = CreateContainerOptionsBuilder::new()
+            .name("target-1")
+            .build();
+        let config = ContainerCreateBody {
+            image: Some("postgres:11-alpine".into()),
+            ..Default::default()
+        };
+        let classify = |status, body: &str, known| {
+            admitted_create_rejection(&reply(status, body), known, Some(&options), &config, true)
+        };
+        let id = "ab".repeat(32);
+        let diagnostic = conflict("target-1", &id);
+        for (status, body) in [
+            (404, "No such image: postgres:11-alpine"),
+            (409, diagnostic.as_str()),
+        ] {
+            assert_eq!(classify(status, body, true), Some(status));
+            assert_eq!(classify(status, body, false), None);
+            for changed in [
+                format!("{body}\n"),
+                format!("prefix {body}"),
+                body.replace("target-1", "foreign")
+                    .replace("11-alpine", "12"),
+            ] {
+                assert_eq!(classify(status, &changed, true), None);
+            }
+            for other_status in (100..600).filter(|s| *s != 404 && *s != 409) {
+                assert_eq!(classify(other_status, body, true), None);
+            }
+        }
+        let conflict_for = |name: &str, id: &str| {
+            let options = CreateContainerOptionsBuilder::new().name(name).build();
+            admitted_create_rejection(
+                &reply(409, &conflict(name, id)),
+                true,
+                Some(&options),
+                &config,
+                true,
+            )
+        };
+        for bad_name in ["", "/target-1", "-target", "a/b", "a\"b", "é"] {
+            assert_eq!(conflict_for(bad_name, &id), None);
+        }
+        assert_eq!(
+            admitted_create_rejection(&reply(409, &diagnostic), true, None, &config, true),
+            None
+        );
+        for bad_id in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            "\"".repeat(64),
+        ] {
+            assert_eq!(conflict_for("target-1", &bad_id), None);
+        }
+        for image in [
+            "postgres",
+            "postgres:",
+            "postgres:tag:extra",
+            "library/postgres:11",
+            "host:5000/postgres:11",
+            "postgres@sha256:abc",
+            "Postgres:11",
+            "postgres:-tag",
+            "postgres:é",
+        ] {
+            let mut bad = config.clone();
+            bad.image = Some(image.into());
+            let result = reply(404, &format!("No such image: {image}"));
+            assert_eq!(
+                admitted_create_rejection(&result, true, Some(&options), &bad, true),
+                None
+            );
+        }
+        let classify_result =
+            |result: &_| admitted_create_rejection(result, true, Some(&options), &config, true);
+        assert_eq!(classify_result(&Ok("actual-id".into())), None);
+        let transport = Err(ClientError::CreateContainer(
+            bollard::errors::Error::IOError {
+                err: std::io::Error::other("lost ACK"),
+            },
+        ));
+        assert_eq!(classify_result(&transport), None);
+    }
+
+    #[test]
+    fn base_image_rejection_checks_final_config_and_modifier_network_exclusion() {
+        let config = ContainerCreateBody {
+            image: Some("postgres:11-alpine".into()),
+            host_config: Some(HostConfig::default()),
+            ..Default::default()
+        };
+        let result = reply(404, "No such image: postgres:11-alpine");
+        assert_eq!(
+            admitted_create_rejection(&result, true, None, &config, true),
+            Some(404)
+        );
+        assert_eq!(
+            admitted_create_rejection(&result, true, None, &config, false),
+            None
+        );
+        use serde_json::json;
+        let exclusions = [
+            json!({"HostConfig": {"Mounts": [{"Type": "image", "Source": "postgres:11-alpine"}]}}),
+            json!({"HostConfig": {"Binds": ["/a:/b"]}}),
+            json!({"HostConfig": {"Tmpfs": {"/tmp": ""}}}),
+            json!({"HostConfig": {"VolumesFrom": ["foreign"]}}),
+            json!({"HostConfig": {"Devices": [{}]}}),
+            json!({"HostConfig": {"DeviceRequests": [{}]}}),
+            json!({"HostConfig": {"VolumeDriver": "local"}}),
+            json!({"HostConfig": {"Runtime": "runc"}}),
+            json!({"HostConfig": {"StorageOpt": {}}}),
+            json!({"Volumes": ["/data"]}),
+            json!({"HostConfig": {"NetworkMode": "bridge"}}),
+            json!({"NetworkingConfig": {}}),
+            json!({"Image": null}),
+            json!({"HostConfig": {"Mounts": [{}]}}),
+        ];
+        for excluded in exclusions {
+            let mut bad = serde_json::to_value(&config).unwrap();
+            bad.as_object_mut()
+                .unwrap()
+                .extend(excluded.as_object().unwrap().clone());
+            let bad: ContainerCreateBody = serde_json::from_value(bad).unwrap();
+            assert_eq!(
+                admitted_create_rejection(&result, true, None, &bad, true),
+                None,
+                "{excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_late_diagnostics_require_verified_classic_info_on_one_daemon() {
+        use crate::core::client::CreateProvenance;
+        use serde_json::json;
+        let version = serde_json::from_value(
+            json!({"Version":"28.0.1","GitCommit":"bbd0a17","Os":"linux","ApiVersion":"1.48"}),
+        )
+        .unwrap();
+        let info = json!({"ID":"daemon-a","OSType":"linux","ServerVersion":"28.0.1","Driver":"overlay2",
+            "DriverStatus":[["Backing Filesystem","xfs"],["Supports d_type","true"],["Using metacopy","false"],
+                ["Native Overlay Diff","true"],["userxattr","false"]]});
+        let decode = |value| {
+            CreateProvenance::from_records(&version, &serde_json::from_value(value).unwrap())
+        };
+        let before = decode(info.clone());
+        assert!(before.is_some());
+        let mut containerd = info.clone();
+        containerd["DriverStatus"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(["driver-type", "io.containerd.snapshotter.v1"]));
+        let mut changed = info.clone();
+        changed["ID"] = json!("daemon-b");
+        let mut missing = info.clone();
+        missing.as_object_mut().unwrap().remove("DriverStatus");
+        let options = CreateContainerOptionsBuilder::new().name("audit").build();
+        let config = ContainerCreateBody {
+            image: Some("postgres:11-alpine".into()),
+            ..Default::default()
+        };
+        let conflict = conflict("audit", &"a".repeat(64));
+        for (status, message) in [
+            (404, "No such image: postgres:11-alpine"),
+            (409, conflict.as_str()),
+        ] {
+            let result = reply(status, message);
+            assert_eq!(
+                admitted_create_rejection(
+                    &result,
+                    before.is_some() && decode(info.clone()) == before,
+                    Some(&options),
+                    &config,
+                    true
+                ),
+                Some(status)
+            );
+            for unsupported in [containerd.clone(), missing.clone(), changed.clone()] {
+                let after = decode(unsupported);
+                assert_eq!(
+                    admitted_create_rejection(
+                        &result,
+                        before.is_some() && after == before,
+                        Some(&options),
+                        &config,
+                        true
+                    ),
+                    None
+                );
+            }
+            assert_eq!(
+                admitted_create_rejection(&result, false, Some(&options), &config, true),
+                None
+            ); // unverified/failed INFO
+        }
+    }
+
+    #[test]
+    fn classic_certificates_require_entire_final_subset_for_both_statuses() {
+        use serde_json::json;
+        let options = CreateContainerOptionsBuilder::new().name("audit").build();
+        let config = ContainerCreateBody {
+            image: Some("postgres:11-alpine".into()),
+            ..Default::default()
+        };
+        let message = conflict("audit", &"a".repeat(64));
+        for (status, message) in [
+            (404, "No such image: postgres:11-alpine"),
+            (409, message.as_str()),
+        ] {
+            let result = reply(status, message);
+            assert_eq!(
+                admitted_create_rejection(&result, true, Some(&options), &config, true),
+                Some(status)
+            );
+            assert_eq!(
+                admitted_create_rejection(&result, false, Some(&options), &config, true),
+                None
+            );
+            assert_eq!(
+                admitted_create_rejection(&result, true, Some(&options), &config, false),
+                None
+            );
+            for patch in [
+                json!({"Volumes":["/data"]}),
+                json!({"NetworkingConfig":{}}),
+                json!({"Image":null}),
+                json!({"HostConfig":{"Mounts":[{}]}}),
+                json!({"HostConfig":{"Binds":["/tmp:/data"]}}),
+                json!({"HostConfig":{"Tmpfs":{"/data":"rw"}}}),
+                json!({"HostConfig":{"VolumesFrom":["foreign"]}}),
+                json!({"HostConfig":{"Devices":[{}]}}),
+                json!({"HostConfig":{"DeviceRequests":[{}]}}),
+                json!({"HostConfig":{"VolumeDriver":"local"}}),
+                json!({"HostConfig":{"Runtime":"runc"}}),
+                json!({"HostConfig":{"StorageOpt":{}}}),
+                json!({"HostConfig":{"NetworkMode":"bridge"}}),
+            ] {
+                let mut bad = serde_json::to_value(&config).unwrap();
+                bad.as_object_mut()
+                    .unwrap()
+                    .extend(patch.as_object().unwrap().clone());
+                let bad = serde_json::from_value(bad).unwrap();
+                assert_eq!(
+                    admitted_create_rejection(&result, true, Some(&options), &bad, true),
+                    None,
+                    "{status}: {patch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classic_admission_never_broadens_to_400_unknown_or_transport_results() {
+        let options = CreateContainerOptionsBuilder::new().name("audit").build();
+        let config = ContainerCreateBody {
+            image: Some("postgres:11-alpine".into()),
+            ..Default::default()
+        };
+        let conflict = conflict("audit", &"a".repeat(64));
+        for status in (100..600).filter(|status| !matches!(status, 404 | 409)) {
+            for message in ["No such image: postgres:11-alpine", conflict.as_str()] {
+                assert_eq!(
+                    admitted_create_rejection(
+                        &reply(status, message),
+                        true,
+                        Some(&options),
+                        &config,
+                        true
+                    ),
+                    None
+                );
+            }
+        }
+        for status in [404, 409] {
+            assert_eq!(
+                admitted_create_rejection(
+                    &reply(status, "unknown diagnostic"),
+                    true,
+                    Some(&options),
+                    &config,
+                    true
+                ),
+                None
+            );
+        }
+        let transport = Err(ClientError::CreateContainer(
+            bollard::errors::Error::IOError {
+                err: std::io::Error::other("lost transport"),
+            },
+        ));
+        assert_eq!(
+            admitted_create_rejection(&transport, true, Some(&options), &config, true),
+            None
+        );
+        assert_eq!(
+            admitted_create_rejection(&Ok("actual-id".into()), true, Some(&options), &config, true),
+            None
+        );
+        assert!(!needs_noncreation_provenance(&Ok("actual-id".into())));
+        assert!(!needs_noncreation_provenance(&transport));
+    }
+
+    async fn causal_boundary_publication() {
+        let owner = StartupOwner::new(GenericImage::new("postgres", "11-alpine").into());
+        let mut state = owner.0.lock().await;
+        let options = CreateContainerOptionsBuilder::new()
+            .name(&state.name)
+            .build();
+        let config = ContainerCreateBody {
+            image: Some("postgres:11-alpine".into()),
+            ..Default::default()
+        };
+        let missing = reply(404, "No such image: postgres:11-alpine");
+        let collect = |state: &mut StartupState<GenericImage>, result: &_, known| {
+            state.collect_create_rejection(admitted_create_rejection(
+                result,
+                known,
+                Some(&options),
+                &config,
+                true,
+            ))
+        };
+        state.arm_create();
+        assert!(owner.snapshot().submitted);
+        assert!(!collect(&mut state, &missing, false)); // Ambiguous404 cannot enter pull.
+        assert!(owner.snapshot().submitted);
+        assert!(collect(&mut state, &missing, true));
+        assert!(!owner.snapshot().submitted); // Already published before polling pull.
+        let failed_pull = async {
+            assert!(!owner.snapshot().submitted);
+            Err(ClientError::PullImage {
+                descriptor: "postgres:11-alpine".into(),
+                err: bollard::errors::Error::IOError {
+                    err: std::io::Error::other("pull failed"),
+                },
+            })
+        };
+        assert!(state.pull_before_retry(failed_pull).await.is_err());
+        assert!(!state.submitted && !owner.snapshot().submitted);
+        state
+            .pull_before_retry(async {
+                assert!(!owner.snapshot().submitted);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(state.submitted && owner.snapshot().submitted); // Retry is not polled yet.
+        assert!(collect(&mut state, &missing, true)); // Final404 also clears before ?.
+        assert!(!owner.snapshot().submitted && !owner.snapshot().collision);
+        let conflict_reply = reply(
+            409,
+            &conflict(&options.name.clone().unwrap(), &"ab".repeat(32)),
+        );
+        for result in [
+            &missing,
+            &conflict_reply,
+            &reply(400, "bad parameter"),
+            &reply(500, "late failure"),
+            &reply(409, "unknown conflict"),
+            &Ok("actual-id".into()),
+        ] {
+            for _attempt in 0..2 {
+                // Same production boundary for initial and retry POSTs.
+                state.arm_create();
+                let proposed =
+                    admitted_create_rejection(result, true, Some(&options), &config, true);
+                assert_eq!(collect(&mut state, result, true), proposed == Some(404));
+                assert_eq!(owner.snapshot().submitted, proposed.is_none());
+                assert_eq!(owner.snapshot().collision, proposed == Some(409));
+            }
+        }
+        state.arm_create();
+        assert!(!collect(&mut state, &Ok("actual-id".into()), true));
+        let Err(callback_error) = conflict_reply else {
+            unreachable!()
+        };
+        state.fail(callback_error.into()); // Exact certificate-shaped callback is never classified.
+        assert!(owner.snapshot().submitted && !owner.snapshot().collision);
+        assert!(owner.snapshot().failure.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn causal_boundaries_current_thread() {
+        causal_boundary_publication().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn causal_boundaries_multi_thread() {
+        causal_boundary_publication().await;
+    }
 
     fn post_error(status_code: u16) -> ClientError {
         ClientError::CreateContainer(bollard::errors::Error::DockerResponseServerError {
