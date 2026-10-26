@@ -7,7 +7,7 @@ use super::host::HostPortExposure;
 use crate::{
     core::{
         async_drop, client::Client, copy::CopyFileFromContainer, env, error::Result,
-        network::Network, ContainerState,
+        network::Network, ContainerState, WaitFor,
     },
     ContainerRequest, Image,
 };
@@ -36,6 +36,8 @@ pub struct ContainerAsync<I: Image> {
     image: ContainerRequest<I>,
     network: Option<Arc<Network>>,
     dropped: bool,
+    #[cfg(test)]
+    pub(crate) log_consumers_started: bool,
     #[cfg(feature = "host-port-exposure")]
     host_port_exposure: Option<HostPortExposure>,
     #[cfg(feature = "reusable-containers")]
@@ -64,36 +66,96 @@ where
             #[cfg(feature = "host-port-exposure")]
             host_port_exposure,
         );
-        let state = ContainerState::from_container(&container).await?;
-        for cmd in container.image().exec_before_ready(state)? {
-            container.exec(cmd).await?;
-        }
-        container.block_until_ready(ready_conditions).await?;
+        container.wait_until_ready(ready_conditions).await?;
         Ok(container)
+    }
+
+    pub(crate) async fn wait_until_ready(&self, ready_conditions: Vec<WaitFor>) -> Result<()> {
+        let state = ContainerState::from_container(self).await?;
+        for cmd in self.image().exec_before_ready(state)? {
+            self.exec(cmd).await?;
+        }
+        self.block_until_ready(ready_conditions).await
+    }
+
+    pub(crate) async fn copy_to_container(&self) -> Result<()> {
+        let sources: Vec<_> = self.image.copy_to_sources().collect();
+        for source in sources {
+            self.docker_client()
+                .copy_to_container(self.id(), source)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn startup_timeout(&self) -> std::time::Duration {
+        self.image
+            .startup_timeout()
+            .unwrap_or(std::time::Duration::from_secs(60))
+    }
+
+    pub(crate) async fn start_until_ready(&mut self) -> Result<()> {
+        self.docker_client().start_container(self.id()).await?;
+        let ready_conditions = self.image.ready_conditions();
+        self.start_log_consumers();
+        self.wait_until_ready(ready_conditions).await?;
+        let state = ContainerState::from_container(self).await?;
+        for cmd in self.image().exec_after_start(state)? {
+            self.exec(cmd).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn construct(
         id: String,
         docker_client: Arc<Client>,
-        mut container_req: ContainerRequest<I>,
+        container_req: ContainerRequest<I>,
+        network: Option<Arc<Network>>,
+        #[cfg(feature = "host-port-exposure")] host_port_exposure: Option<HostPortExposure>,
+    ) -> ContainerAsync<I> {
+        let mut container = Self::construct_owner(
+            id,
+            docker_client,
+            container_req,
+            network,
+            #[cfg(feature = "host-port-exposure")]
+            host_port_exposure,
+        );
+        container.start_log_consumers();
+        container
+    }
+
+    pub(crate) fn construct_owner(
+        id: String,
+        docker_client: Arc<Client>,
+        container_req: ContainerRequest<I>,
         network: Option<Arc<Network>>,
         #[cfg(feature = "host-port-exposure")] host_port_exposure: Option<HostPortExposure>,
     ) -> ContainerAsync<I> {
         #[cfg(feature = "reusable-containers")]
         let reuse = container_req.reuse();
 
-        let log_consumers = std::mem::take(&mut container_req.log_consumers);
-        let container = ContainerAsync {
+        ContainerAsync {
             raw: raw::RawContainer::new(id, docker_client),
             image: container_req,
             network,
             dropped: false,
+            #[cfg(test)]
+            log_consumers_started: false,
             #[cfg(feature = "host-port-exposure")]
             host_port_exposure,
             #[cfg(feature = "reusable-containers")]
             reuse,
-        };
+        }
+    }
 
+    pub(crate) fn start_log_consumers(&mut self) {
+        #[cfg(test)]
+        {
+            self.log_consumers_started = true;
+        }
+        let log_consumers = std::mem::take(&mut self.image.log_consumers);
+        let container = &*self;
         if !log_consumers.is_empty() {
             let mut logs = container.docker_client().logs(container.id(), true);
             let container_id = container.id().to_string();
@@ -115,8 +177,6 @@ where
                 }
             });
         }
-
-        container
     }
 
     /// Returns a reference to the [`Image`] of this container.
@@ -201,6 +261,37 @@ where
         self.raw.copy_file_from(container_path, target).await
     }
 
+    /// Removes this exact container, retaining ownership on error or cancellation.
+    /// Only an inspect 404 disarms its destructor. Callers must latch every error.
+    pub async fn rm_retained(&mut self) -> Result<()> {
+        use crate::core::error::{ClientError, TestcontainersError};
+        for attempt in 0..2 {
+            match self.docker_client().inspect(self.id()).await {
+                Err(ClientError::InspectContainer(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404, ..
+                    },
+                )) => {
+                    #[cfg(feature = "ownership-observe")]
+                    crate::ownership_observe::record(
+                        crate::ownership_observe::Kind::ExactId404,
+                        self.id(),
+                        None,
+                        Some(self.dropped),
+                    );
+                    self.dropped = true;
+                    #[cfg(feature = "watchdog")]
+                    crate::watchdog::unregister(self.id());
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) if attempt == 0 => self.docker_client().rm(self.id()).await?,
+                Ok(_) => return Err(TestcontainersError::other("removed container still exists")),
+            }
+        }
+        Err(TestcontainersError::other("removed container still exists"))
+    }
+
     /// Removes the container.
     pub async fn rm(mut self) -> Result<()> {
         log::debug!("Deleting docker container {}", self.id());
@@ -246,6 +337,13 @@ where
     I: Image,
 {
     fn drop(&mut self) {
+        #[cfg(feature = "ownership-observe")]
+        crate::ownership_observe::record(
+            crate::ownership_observe::Kind::ActualDrop,
+            self.id(),
+            None,
+            Some(self.dropped),
+        );
         #[cfg(feature = "reusable-containers")]
         {
             use crate::ReuseDirective::{Always, CurrentSession};
@@ -253,7 +351,7 @@ where
             if !self.dropped && matches!(self.reuse, Always | CurrentSession) {
                 log::debug!(
                     "Declining to reap container marked for reuse: {}",
-                    &self.id()
+                    self.id()
                 );
 
                 return;
@@ -286,6 +384,13 @@ where
                 log::debug!("Container {id} was successfully dropped");
             };
 
+            #[cfg(feature = "ownership-observe")]
+            crate::ownership_observe::record(
+                crate::ownership_observe::Kind::AsyncDropDispatch,
+                self.id(),
+                None,
+                Some(self.dropped),
+            );
             async_drop::async_drop(drop_task);
         }
     }

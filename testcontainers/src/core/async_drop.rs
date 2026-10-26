@@ -14,6 +14,13 @@ static DROP_TASK_SENDER: OnceLock<tokio::sync::mpsc::UnboundedSender<BoxFuture<'
 // We can consider creating `AsyncDrop` trait + `AsyncDropGuard<T: AsyncDrop>` wrapper to make it more ergonomic.
 // However, we have a only couple of places where we need this functionality.
 pub(crate) fn async_drop(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    #[cfg(feature = "ownership-observe")]
+    crate::ownership_observe::record(
+        crate::ownership_observe::Kind::AsyncDropEntry,
+        "",
+        None,
+        None,
+    );
     let handle = tokio::runtime::Handle::current();
     match handle.runtime_flavor() {
         tokio::runtime::RuntimeFlavor::CurrentThread => {
